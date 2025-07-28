@@ -27,7 +27,7 @@ import sys
 import os
 
 # Add the 'agentdry' directory to the system path
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
 from utils.openai_format_check import transform_schema, parse_response
 from utils.initiate_autotool_creation import extract_info_and_create_tool
 from main import create_and_update_tool
