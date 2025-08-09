@@ -10,7 +10,6 @@ LOG_DIR = "logs"
 if not os.path.exists(LOG_DIR):
     os.makedirs(LOG_DIR)
 
-# Configure logger to write to a file and to the console
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -34,19 +33,15 @@ def file_watcher():
             current_modified = os.path.getmtime(current_file)
             if current_modified > last_modified:
                 logger.info("File changed, restarting server...")
-                try:
-                    mcp.stop()
-                except Exception as e:
-                    logger.warning(f"Could not stop MCP server cleanly: {e}")
-                
-                time.sleep(2)  # Give the OS time to release the port
+                last_modified = current_modified
+                time.sleep(3)  # Increased delay to allow resource release
                 python = sys.executable
                 os.execl(python, python, *sys.argv)
         except FileNotFoundError:
             logger.warning(f"Watched file {current_file} not found. Watcher stopping.")
             break
         except Exception as e:
-            logger.error(f"Error in file watcher: {e}")
+            logger.error(f"Error in file watcher: {e}", exc_info=True)
 
 # --- MCP Server and Tools ---
 mcp = FastMCP("Math")
@@ -73,4 +68,8 @@ if __name__ == "__main__":
     watcher_thread = threading.Thread(target=file_watcher, daemon=True)
     watcher_thread.start()
     logger.info(f"MCP Server started. Watching {current_file} for changes...")
-    mcp.run(transport='sse')
+    try:
+        mcp.run(transport='sse')
+    except Exception as e:
+        logger.error(f"Server failed to run: {e}", exc_info=True)
+        raise
