@@ -9,6 +9,20 @@ from typing import Any, Dict, List, Optional
 import httpx
 from dotenv import load_dotenv
 from google import generativeai as genai
+# Updated imports for proper content handling
+try:
+    from google.generativeai.types import Content, Part, FunctionCall, FunctionResponse
+except ImportError:
+    # Fallback imports if the above don't work
+    try:
+        from google.ai.generativelanguage import Content, Part, FunctionCall, FunctionResponse
+    except ImportError:
+        # Use the genai module directly
+        Content = genai.protos.Content
+        Part = genai.protos.Part
+        FunctionCall = genai.protos.FunctionCall
+        FunctionResponse = genai.protos.FunctionResponse
+
 from mcp import ClientSession
 from mcp.client.sse import sse_client
 
@@ -244,7 +258,7 @@ class ConversationManager:
 
 
 class AgentDRY:
-    """Main agent class with iterative tool calling."""
+    """Main agent class with intelligent tool calling and creation."""
 
     def __init__(
         self,
@@ -257,7 +271,8 @@ class AgentDRY:
         self.tool_manager = MCPToolManager(self.connection_manager)
         self.conversation = ConversationManager()
         self.server_available = False
-        self.max_tool_iterations = max_tool_iterations  # Prevent infinite loops
+        self.max_tool_iterations = max_tool_iterations
+        self.server_context = ""  # Store server context/domain
 
     async def initialize(self) -> bool:
         """Initialize the agent."""
@@ -265,10 +280,38 @@ class AgentDRY:
             self.server_available = await self.connection_manager.check_server_health()
             if self.server_available:
                 await self.tool_manager.refresh_tools()
+                # Analyze server context based on available tools
+                await self._analyze_server_context()
             return True
         except Exception as e:
             logger.error(f"Initialization failed: {e}")
             return False
+
+    async def _analyze_server_context(self):
+        """Analyze the server context based on available tools."""
+        tools = await self.tool_manager.get_tools()
+        if not tools:
+            self.server_context = "unknown"
+            return
+            
+        tool_descriptions = [f"{tool.name}: {tool.description}" for tool in tools]
+        tools_text = "\n".join(tool_descriptions)
+        
+        analysis_prompt = f"""
+        Based on these available tools, identify the domain/context of this MCP server:
+        
+        {tools_text}
+        
+        Respond with just one word describing the domain (e.g., "math", "file", "web", "database", "api", etc.)
+        """
+        
+        try:
+            context = await self.llm.generate_response(analysis_prompt)
+            self.server_context = context.lower().strip()
+            logger.info(f"Detected server context: {self.server_context}")
+        except Exception as e:
+            logger.error(f"Failed to analyze server context: {e}")
+            self.server_context = "unknown"
 
     def _convert_to_gemini_schema(self, mcp_schema: Dict[str, Any]) -> Dict[str, Any]:
         """Convert MCP schema to Gemini function calling schema format."""
@@ -297,221 +340,311 @@ class AgentDRY:
 
     def _convert_proto_map_to_dict(self, proto_map: Any) -> Any:
         """Recursively converts a proto map to a Python dictionary."""
-        from proto.marshal.collections.maps import MapComposite
-        from proto.marshal.collections.repeated import RepeatedComposite
+        try:
+            from proto.marshal.collections.maps import MapComposite
+            from proto.marshal.collections.repeated import RepeatedComposite
 
-        if isinstance(proto_map, MapComposite):
+            if isinstance(proto_map, MapComposite):
+                return {
+                    key: self._convert_proto_map_to_dict(value)
+                    for key, value in proto_map.items()
+                }
+            if isinstance(proto_map, RepeatedComposite):
+                return [self._convert_proto_map_to_dict(item) for item in proto_map]
+            return proto_map
+        except ImportError:
+            # Fallback if proto modules are not available
+            if hasattr(proto_map, 'items'):
+                return dict(proto_map.items())
+            elif hasattr(proto_map, '__iter__') and not isinstance(proto_map, str):
+                return list(proto_map)
+            return proto_map
+
+    def _create_content_objects(self, role: str, parts: List[Any]) -> Any:
+        """Create content objects compatible with Gemini API."""
+        try:
+            # Try using the imported classes first
+            return Content(role=role, parts=parts)
+        except (NameError, AttributeError):
+            # Fallback to dictionary format
             return {
-                key: self._convert_proto_map_to_dict(value)
-                for key, value in proto_map.items()
+                "role": role,
+                "parts": parts
             }
-        if isinstance(proto_map, RepeatedComposite):
-            return [self._convert_proto_map_to_dict(item) for item in proto_map]
-        return proto_map
+
+    def _create_part_objects(self, text: str = None, function_call: Any = None, function_response: Any = None) -> Any:
+        """Create part objects compatible with Gemini API."""
+        try:
+            # Try using the imported classes first
+            if text:
+                return Part(text=text)
+            elif function_call:
+                return Part(function_call=function_call)
+            elif function_response:
+                return Part(function_response=function_response)
+        except (NameError, AttributeError):
+            # Fallback to dictionary format
+            if text:
+                return {"text": text}
+            elif function_call:
+                return {"function_call": function_call}
+            elif function_response:
+                return {"function_response": function_response}
+
+    async def _should_use_tools_or_create(self, query: str, available_tools: List[MCPTool]) -> str:
+        """
+        Let LLM decide whether to use existing tools, create new tool, or respond directly.
+        Returns: 'use_tools', 'create_tool', or 'respond_directly'
+        """
+        if not available_tools:
+            return "respond_directly"
+            
+        tools_context = "\n".join([f"- {tool.name}: {tool.description}" for tool in available_tools])
+        
+        decision_prompt = f"""
+        You are an intelligent assistant with access to an MCP server in the {self.server_context} domain.
+
+        Available tools:
+        {tools_context}
+
+        User query: "{query}"
+
+        Analyze the query and determine the best approach:
+
+        1. If the query can be handled by the existing tools, respond with: "use_tools"
+        2. If the query requires functionality not available in existing tools BUT is clearly within the {self.server_context} domain (like a missing math operation for a math server), respond with: "create_tool"  
+        3. If the query is asking you to explicitly create a function/tool, respond with: "create_tool"
+        4. If the query is completely outside the {self.server_context} domain or is a general question, respond with: "respond_directly"
+
+        Respond with ONLY one of these three options: use_tools, create_tool, or respond_directly
+        """
+        
+        try:
+            decision = await self.llm.generate_response(decision_prompt, temperature=0.0)
+            decision = decision.strip().lower()
+            
+            if decision in ["use_tools", "create_tool", "respond_directly"]:
+                logger.info(f"LLM decision for query '{query}': {decision}")
+                return decision
+            else:
+                logger.warning(f"Invalid LLM decision: {decision}, defaulting to respond_directly")
+                return "respond_directly"
+        except Exception as e:
+            logger.error(f"Error in decision making: {e}")
+            return "respond_directly"
 
     async def _iterative_tool_execution(
         self, query: str, tools: List[MCPTool]
     ) -> Optional[QueryResult]:
-        """Execute tools iteratively until the LLM decides it's done."""
+        """
+        Executes tools iteratively with improved compatibility for different Gemini API versions.
+        """
         if not tools or not self.server_available:
             return None
 
         tools_called = []
-        conversation_parts = []
-
+        
         try:
-            # Prepare tools for LLM function calling
-            tool_declarations = []
-            for tool in tools:
-                tool_declarations.append(
-                    {
-                        "name": tool.name,
-                        "description": tool.description,
-                        "parameters": self._convert_to_gemini_schema(tool.parameters),
-                    }
-                )
-
+            # 1. Prepare tools for the Gemini API
+            tool_declarations = [
+                {
+                    "name": tool.name,
+                    "description": tool.description,
+                    "parameters": self._convert_to_gemini_schema(tool.parameters),
+                }
+                for tool in tools
+            ]
             if not tool_declarations:
                 return None
 
-            # Start with user query
-            conversation_parts = [{"role": "user", "parts": [{"text": query}]}]
-            combined_tools = {"function_declarations": tool_declarations}
+            # 2. Start conversation history - use simpler approach
+            chat_history = [
+                self._create_content_objects("user", [self._create_part_objects(text=query)])
+            ]
 
-            # Iterative tool calling loop
+            # 3. Start the iterative tool calling loop
             for iteration in range(self.max_tool_iterations):
-                logger.info(f"Tool calling iteration {iteration + 1}")
-
-                # Get LLM response
+                logger.info(f"Tool iteration {iteration + 1}/{self.max_tool_iterations}")
+                
                 response = await asyncio.to_thread(
                     self.llm.model.generate_content,
-                    conversation_parts,
-                    tools=combined_tools,
+                    chat_history,
+                    tools={"function_declarations": tool_declarations},
                     generation_config={"temperature": 0.0},
                 )
-
-                if not (hasattr(response, "candidates") and response.candidates):
-                    break
-
-                candidate = response.candidates[0]
-                if not hasattr(candidate.content, "parts") or not candidate.content.parts:
-                    break
                 
-                # Add model's response to conversation
-                conversation_parts.append(candidate.content)
+                model_response_content = response.candidates[0].content
+                chat_history.append(model_response_content)
 
-                # Check if any part contains a function call
-                function_calls_made = False
-                tool_responses = []
+                # Check if model wants to call functions
+                function_calls = []
+                for part in model_response_content.parts:
+                    if hasattr(part, 'function_call') and part.function_call:
+                        function_calls.append(part)
 
-                for part in candidate.content.parts:
-                    if hasattr(part, "function_call") and part.function_call:
-                        function_calls_made = True
-                        tool_name = part.function_call.name
-                        arguments = self._convert_proto_map_to_dict(
-                            part.function_call.args
+                if not function_calls:
+                    # Model is done, extract final response
+                    break
+
+                # 5. Execute function calls
+                tasks = []
+                for part in function_calls:
+                    fc = part.function_call
+                    tool_name = fc.name
+                    arguments = self._convert_proto_map_to_dict(fc.args)
+                    
+                    logger.info(f"LLM calling tool: {tool_name} with args: {arguments}")
+                    tools_called.append(tool_name)
+                    tasks.append(self.tool_manager.execute_tool(tool_name, arguments))
+                
+                results = await asyncio.gather(*tasks)
+
+                # 6. Create function response parts
+                function_response_parts = []
+                for tool_result, part in zip(results, function_calls):
+                    if tool_result.success:
+                        output_data = tool_result.response
+                    else:
+                        output_data = f"Tool failed: {tool_result.error}"
+
+                    # Create function response
+                    try:
+                        response_obj = FunctionResponse(
+                            name=part.function_call.name,
+                            response={"output": output_data},
                         )
+                        function_response_parts.append(self._create_part_objects(function_response=response_obj))
+                    except (NameError, AttributeError):
+                        # Fallback to dictionary format
+                        function_response_parts.append({
+                            "function_response": {
+                                "name": part.function_call.name,
+                                "response": {"output": output_data}
+                            }
+                        })
+                
+                # Append the tool response turn
+                chat_history.append(
+                    self._create_content_objects("tool", function_response_parts)
+                )
 
-                        logger.info(
-                            f"LLM called tool: {tool_name} with args: {arguments}"
-                        )
-                        tools_called.append(tool_name)
+            # 7. Extract final text response
+            final_content = chat_history[-1]
+            final_text_response = ""
+            
+            if hasattr(final_content, 'parts'):
+                parts = final_content.parts
+            else:
+                parts = final_content.get('parts', [])
+            
+            for part in parts:
+                if hasattr(part, 'text') and part.text:
+                    final_text_response += part.text
+                elif isinstance(part, dict) and 'text' in part:
+                    final_text_response += part['text']
 
-                        # Execute the tool
-                        tool_result = await self.tool_manager.execute_tool(
-                            tool_name, arguments
-                        )
-
-                        # Append the tool response in the correct format
-                        if tool_result.success:
-                            tool_responses.append(
-                                {
-                                    "role": "tool",
-                                    "parts": [
-                                        {
-                                            "function_response": {
-                                                "name": tool_name,
-                                                "response": {"result": tool_result.response},
-                                            }
-                                        }
-                                    ],
-                                }
-                            )
-                        else:
-                            tool_responses.append(
-                                {
-                                    "role": "tool",
-                                    "parts": [
-                                        {
-                                            "function_response": {
-                                                "name": tool_name,
-                                                "response": {
-                                                    "result": f"Tool failed: {tool_result.error}"
-                                                },
-                                            }
-                                        }
-                                    ],
-                                }
-                            )
-
-                # If no function calls were made, we're done
-                if not function_calls_made:
-                    # Extract final response
-                    final_text = ""
-                    for part in candidate.content.parts:
-                        if hasattr(part, "text") and part.text:
-                            final_text += part.text
-
-                    return QueryResult(
-                        success=True,
-                        response=final_text.strip() or "Task completed successfully",
-                        tool_used=len(tools_called) > 0,
-                        tools_called=tools_called,
-                    )
-
-                # Add tool responses to conversation for the next iteration
-                conversation_parts.extend(tool_responses)
-
-            # If we exit the loop due to max iterations
-            logger.warning(f"Reached maximum tool iterations ({self.max_tool_iterations})")
             return QueryResult(
                 success=True,
-                response="Task completed after maximum tool iterations.",
+                response=final_text_response.strip() or "Task completed successfully.",
                 tool_used=len(tools_called) > 0,
-                tools_called=tools_called,
+                tools_called=list(set(tools_called)),
             )
 
         except Exception as e:
-            logger.error(f"Iterative tool execution failed: {e}")
+            logger.error(f"Iterative tool execution failed: {e}", exc_info=True)
             return QueryResult(
                 success=False,
-                response=f"Tool execution failed: {str(e)}",
+                response=f"An error occurred during tool execution: {str(e)}",
                 error=str(e),
-                tools_called=tools_called,
+                tools_called=list(set(tools_called)),
             )
 
     async def process_query(self, query: str) -> QueryResult:
-        """Process a user query with iterative tool calling."""
+        """Process a user query with intelligent decision making."""
         try:
             self.conversation.add_message("user", query)
 
-            # Try existing tools first if server is available
-            if self.server_available:
-                tools = await self.tool_manager.get_tools()
+            if not self.server_available:
+                # No server available, respond directly
+                response = await self.llm.generate_response(f"Please answer this query: {query}")
+                self.conversation.add_message("assistant", response)
+                return QueryResult(success=True, response=response)
+
+            # Get available tools and let LLM decide what to do
+            tools = await self.tool_manager.get_tools()
+            decision = await self._should_use_tools_or_create(query, tools)
+            
+            if decision == "use_tools" and tools:
+                # Use existing tools
                 tool_result = await self._iterative_tool_execution(query, tools)
                 if tool_result and tool_result.success:
-                    # Log which tools were used
                     if tool_result.tools_called:
                         logger.info(f"Tools used: {', '.join(tool_result.tools_called)}")
-
                     self.conversation.add_message("assistant", tool_result.response)
                     return tool_result
-
-            # Check if we should create a new tool
-            should_create_tool = await self._should_create_tool(query)
-
-            if should_create_tool and self.server_available:
-                # Create tool
+                else:
+                    # Tool execution failed, fall back to direct response
+                    response = await self.llm.generate_response(f"Please answer this query: {query}")
+                    self.conversation.add_message("assistant", response)
+                    return QueryResult(success=True, response=response)
+                    
+            elif decision == "create_tool":
+                # Create a new tool
                 try:
                     from main import create_and_update_tool
 
-                    create_and_update_tool(f"Create a function for: {query}")
-
-                    # Wait for server restart and refresh tools
-                    await asyncio.sleep(3)
-                    await self.tool_manager.refresh_tools()
-
-                    # Try using the new tool iteratively
-                    updated_tools = await self.tool_manager.get_tools()
-                    tool_result = await self._iterative_tool_execution(
-                        query, updated_tools
-                    )
-                    if tool_result and tool_result.success:
-                        response = f"Created and used new tool(s): {tool_result.response}"
-                        if tool_result.tools_called:
-                            response += (
-                                f" (Tools used: {', '.join(tool_result.tools_called)})"
-                            )
-
+                    # Check if this is an explicit tool creation request
+                    if any(phrase in query.lower() for phrase in ["create a function", "create a tool", "make a function"]):
+                        # Just create the tool and exit
+                        create_and_update_tool(query)
+                        await asyncio.sleep(3)
+                        await self.tool_manager.refresh_tools()
+                        response = f"Tool created successfully based on your request: {query}"
                         self.conversation.add_message("assistant", response)
-                        return QueryResult(
-                            success=True,
-                            response=response,
-                            tool_used=True,
-                            tools_called=tool_result.tools_called,
-                        )
+                        return QueryResult(success=True, response=response, tool_used=False)
+                    else:
+                        # Create tool and then use it to answer the query
+                        create_and_update_tool(f"Create a function to handle: {query}")
+                        await asyncio.sleep(3)
+                        await self.tool_manager.refresh_tools()
+
+                        # Try using the new tool
+                        updated_tools = await self.tool_manager.get_tools()
+                        tool_result = await self._iterative_tool_execution(query, updated_tools)
+                        
+                        if tool_result and tool_result.success:
+                            response = f"Created new tool and executed: {tool_result.response}"
+                            if tool_result.tools_called:
+                                response += f" (New tools used: {', '.join(tool_result.tools_called)})"
+                            self.conversation.add_message("assistant", response)
+                            return QueryResult(
+                                success=True,
+                                response=response,
+                                tool_used=True,
+                                tools_called=tool_result.tools_called,
+                            )
+                        else:
+                            # Tool creation/execution failed, respond directly
+                            response = await self.llm.generate_response(f"Please answer this query: {query}")
+                            self.conversation.add_message("assistant", response)
+                            return QueryResult(success=True, response=response)
 
                 except ImportError:
                     logger.error("Cannot import tool creation function")
+                    response = await self.llm.generate_response(f"Please answer this query: {query}")
+                    self.conversation.add_message("assistant", response)
+                    return QueryResult(success=True, response=response)
                 except Exception as e:
                     logger.error(f"Tool creation failed: {e}")
-
-            # Generate direct response
-            response = await self.llm.generate_response(
-                f"Please answer this query: {query}"
-            )
-            self.conversation.add_message("assistant", response)
-            return QueryResult(success=True, response=response)
+                    response = await self.llm.generate_response(f"Please answer this query: {query}")
+                    self.conversation.add_message("assistant", response)
+                    return QueryResult(success=True, response=response)
+            
+            else:  # decision == "respond_directly"
+                # Generate direct response
+                response = await self.llm.generate_response(f"Please answer this query: {query}")
+                self.conversation.add_message("assistant", response)
+                return QueryResult(success=True, response=response)
 
         except Exception as e:
             error_msg = f"Error processing query: {str(e)}"
@@ -519,27 +652,6 @@ class AgentDRY:
             return QueryResult(
                 success=False, response="Sorry, I encountered an error.", error=str(e)
             )
-
-    async def _should_create_tool(self, query: str) -> bool:
-        """Simple heuristic to determine if a tool should be created."""
-        query_lower = query.lower()
-
-        # Check for computational keywords
-        computational_keywords = [
-            "calculate",
-            "compute",
-            "find",
-            "determine",
-            "factorial",
-            "area",
-            "circumference",
-            "perimeter",
-            "volume",
-            "fibonacci",
-            "prime",
-        ]
-
-        return any(keyword in query_lower for keyword in computational_keywords)
 
     async def delete_tool(self, tool_name: str) -> bool:
         """Delete a tool."""
@@ -564,21 +676,22 @@ class AgentDRY:
         return result
 
 
-# Enhanced CLI with tool usage tracking
+# Enhanced CLI with intelligent decision making
 async def main():
-    """Enhanced CLI interface with tool usage tracking."""
+    """Enhanced CLI interface with intelligent decision making."""
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
         print("Error: GEMINI_API_KEY not found")
         return
 
-    agent = AgentDRY(api_key, max_tool_iterations=10)  # Allow up to 10 tool iterations
+    agent = AgentDRY(api_key, max_tool_iterations=10)
 
     if not await agent.initialize():
         print("Failed to initialize agent")
         return
 
-    print("Enhanced Agent ready with iterative tool calling!")
+    print("🤖 Enhanced Agent ready with intelligent tool calling!")
+    print(f"🔧 Detected server context: {agent.server_context}")
     print("Type 'quit' to exit, 'tools' to list available tools, 'clear' to clear history")
 
     while True:
@@ -607,7 +720,7 @@ async def main():
             result = await agent.process_query_with_details(user_input)
             print(f"Assistant: {result.response}")
 
-            # Show tool usage summary
+            # Show tool usage summary if tools were used
             if result.tool_used and result.tools_called:
                 unique_tools = list(set(result.tools_called))
                 tool_counts = {
