@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 
 # Page configuration
 st.set_page_config(
-    page_title="MCP Agent Dashboard",
+    page_title="AgentDRY",
     page_icon="🤖",
     layout="wide",
     initial_sidebar_state="collapsed"
@@ -41,7 +41,7 @@ st.markdown("""
     }
     
     .stApp {
-        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        background: linear-gradient(135deg, #232526 0%, #414345 100%); 
     }
     
     .stMarkdown {
@@ -168,7 +168,7 @@ def display_header():
     """Display the main header."""
     col1, col2, col3 = st.columns([1, 2, 1])
     with col2:
-        st.markdown("<h1 style='text-align: center; margin-bottom: 2rem;'>🤖 MCP Agent Dashboard</h1>", unsafe_allow_html=True)
+        st.markdown("<h1 style='text-align: center; margin-bottom: 2rem;'> AgentDRY</h1>", unsafe_allow_html=True)
 
 def display_status_bar(agent):
     """Display status information."""
@@ -178,7 +178,7 @@ def display_status_bar(agent):
         st.markdown(f"""
         <div class="metric-card">
             <h4>Server Status</h4>
-            <p style="color: {'#4CAF50' if st.session_state.server_status == 'Connected' else '#f44336'};">
+            <p style="color: {"#A54509" if st.session_state.server_status == 'Connected' else '#f44336'};">
                 {st.session_state.server_status}
             </p>
         </div>
