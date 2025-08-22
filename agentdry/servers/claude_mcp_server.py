@@ -21,7 +21,7 @@ sys.path.insert(0, project_root)
 try:
     from utils.append_to_server import create_tool_from_user_input, append_code_to_server_file
     from main import create_and_update_tool, delete_tool_from_server
-    UTILS_AVAILABLE = True
+    UTILS_AVAILABLE = False  #Make sure this is True , else you are not truly creating the AgentDRY tool.
     print(f"Successfully imported utils from: {project_root}")
 except ImportError as e:
     print(f"Warning: Could not import utility functions: {e}")
@@ -85,8 +85,25 @@ class AgentDRYToolManager:
             
             # Save the tool code to a file for tracking
             tool_file = os.path.join(self.tools_dir, f"{tool_name}.py")
-            with open(tool_file, 'w') as f:
+            with open(tool_file, 'w', encoding='utf-8') as f:
                 f.write(tool_code)
+                
+            try:
+                import importlib.util
+                spec = importlib.util.spec_from_file_location(tool_name, tool_file)
+                module = importlib.util.module_from_spec(spec)
+                sys.modules[tool_name] = module
+                spec.loader.exec_module(module)
+
+                # assume function inside module has the same name as tool_name
+                func = getattr(module, tool_name, None)
+                if func:
+                    self.server.tool()(func)  # <-- registers it live with FastMCP
+                    logger.info(f"AgentDRY registered tool {tool_name} with MCP server")
+                else:
+                    logger.warning(f"No callable {tool_name} found in {tool_file}")
+            except Exception as e:
+                logger.error(f"Failed to load/register tool {tool_name}: {e}")
             
             # Store tool info
             self.dynamic_tools[tool_name] = {
@@ -276,8 +293,15 @@ def execute_python_code(code: str) -> str:
         # Execute the code
         exec(code, namespace)
         tool_name = f"exec_tool_{int(time.time())}.py"
+        tool_file = os.path.join(tool_manager.tools_dir, tool_name)
+        with open(tool_file, 'w', encoding='utf-8') as f:
+            f.write(code)
 
-        return "AgentDRY: Code executed successfully"
+        tool_name = f"exec_tool_{int(time.time())}.py"
+
+        if "result" in namespace:
+            return f"AgentDRY result: {namespace['result']}"
+        return "AgentDRY: Code executed successfully (no result returned)"
         
     except Exception as e:
         return f"AgentDRY error executing code: {str(e)}"
