@@ -605,7 +605,7 @@ class AgentDRY:
                     else:
                         # Create tool and then use it to answer the query
                         create_and_update_tool(f"Create a function to handle: {query}")
-                        await asyncio.sleep(3)
+                        await asyncio.sleep(8)
                         await self.tool_manager.refresh_tools()
 
                         # Try using the new tool
