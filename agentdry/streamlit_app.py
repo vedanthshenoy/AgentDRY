@@ -1,347 +1,427 @@
 import streamlit as st
 import asyncio
-import nest_asyncio
-import os
-import sys
 import logging
-import time
+import os
 from datetime import datetime
+current_dir = os.path.dirname(os.path.abspath(__file__))
+project_root = current_dir  # C:\prass\agentdry
+clients_dir = os.path.join(project_root, 'clients', 'gemini_clients')
 
-# Apply nest_asyncio to handle asyncio in Streamlit
-nest_asyncio.apply()
+# Add paths to system path - KEEP EXACTLY SAME
+import sys
+sys.path.insert(0, project_root)
+sys.path.insert(0, clients_dir)
+from gemini_mcp_client_improved import GeminiMCPClient
+from dotenv import load_dotenv
 
-# Add paths for importing modules
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), 'clients', 'gemini_clients')))
-sys.path.append(os.path.abspath(os.path.dirname(__file__)))
+# Load environment variables
+load_dotenv()
 
-from gemini_mcp_client import GeminiLLM, process_query, load_tools, predict_tool_name
-from main import create_and_update_tool
-from mcp import ClientSession
-from mcp.client.sse import sse_client
-from google.genai import types
-import httpx
+# Configure streamlit logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - STREAMLIT - %(levelname)s - %(message)s',
+    handlers=[logging.FileHandler("logs/streamlit.log"), logging.StreamHandler()]
+)
+logger = logging.getLogger(__name__)
 
-# Configure Streamlit page
+# Page configuration
 st.set_page_config(
-    page_title="AgentDRY - AI Agent with Dynamic Tools",
+    page_title="Gemini MCP Client",
     page_icon="🤖",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="collapsed"
 )
 
-# Custom CSS
+# Custom CSS for better visibility and modern design
 st.markdown("""
 <style>
-    .main-header {
-        text-align: center;
-        padding: 1rem 0;
-        border-bottom: 2px solid #f0f2f6;
-        margin-bottom: 2rem;
+    .main > div {
+        padding-top: 2rem;
     }
-    .status-success { color: #28a745; font-weight: bold; }
-    .status-error { color: #dc3545; font-weight: bold; }
-    .status-warning { color: #ffc107; font-weight: bold; }
+    
+    .stApp {
+        background: linear-gradient(135deg, #232526 0%, #414345 100%); 
+    }
+    
+    .stMarkdown {
+        color: white !important;
+    }
+    
+    .stTextInput > div > div > input {
+        background-color: rgba(255, 255, 255, 0.1);
+        color: white;
+        border: 1px solid rgba(255, 255, 255, 0.3);
+        border-radius: 10px;
+    }
+    
+    .stTextInput > div > div > input::placeholder {
+        color: rgba(255, 255, 255, 0.7);
+    }
+    
+    .stButton > button {
+        background: linear-gradient(45deg, #667eea, #764ba2);
+        color: white;
+        border: none;
+        border-radius: 10px;
+        font-weight: bold;
+        transition: all 0.3s ease;
+    }
+    
+    .stButton > button:hover {
+        transform: translateY(-2px);
+        box-shadow: 0 4px 12px rgba(0,0,0,0.2);
+    }
+    
+    .chat-message {
+        padding: 1rem;
+        margin: 0.5rem 0;
+        border-radius: 10px;
+        backdrop-filter: blur(10px);
+    }
+    
+    .user-message {
+        background: rgba(255, 255, 255, 0.1);
+        border-left: 4px solid #667eea;
+        margin-left: 2rem;
+    }
+    
+    .assistant-message {
+        background: rgba(255, 255, 255, 0.15);
+        border-left: 4px solid #764ba2;
+        margin-right: 2rem;
+    }
+    
+    .tool-card {
+        background: rgba(255, 255, 255, 0.1);
+        padding: 1rem;
+        margin: 0.5rem 0;
+        border-radius: 10px;
+        border: 1px solid rgba(255, 255, 255, 0.2);
+        backdrop-filter: blur(10px);
+    }
+    
+    .stExpander {
+        background: rgba(255, 255, 255, 0.1);
+        border-radius: 10px;
+        border: 1px solid rgba(255, 255, 255, 0.2);
+    }
+    
+    .metric-card {
+        background: rgba(255, 255, 255, 0.1);
+        padding: 1rem;
+        border-radius: 10px;
+        text-align: center;
+        backdrop-filter: blur(10px);
+    }
+    
+    h1, h2, h3 {
+        color: white !important;
+        text-shadow: 2px 2px 4px rgba(0,0,0,0.3);
+    }
+    
+    .stSelectbox > div > div {
+        background-color: rgba(255, 255, 255, 0.1);
+        color: white;
+        border-radius: 10px;
+    }
 </style>
 """, unsafe_allow_html=True)
 
-# Initialize session state
-if "messages" not in st.session_state:
-    st.session_state.messages = []
-if "past_chats" not in st.session_state:
-    st.session_state.past_chats = []
-if "tools" not in st.session_state:
-    st.session_state.tools = []
-if "session" not in st.session_state:
-    st.session_state.session = None
-if "tool_object" not in st.session_state:
-    st.session_state.tool_object = None
-if "server_connected" not in st.session_state:
-    st.session_state.server_connected = False
-if "chat_history" not in st.session_state:
-    st.session_state.chat_history = []
-if "llm" not in st.session_state:
-    st.session_state.llm = None
-
-# Initialize LLM
 @st.cache_resource
-def get_llm():
+def get_client():
+    """Initialize and cache the client."""
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
-        st.error("❌ GEMINI_API_KEY environment variable not found!")
+        st.error("GEMINI_API_KEY not found in environment variables")
         st.stop()
-    return GeminiLLM(api_key=api_key)
+    
+    client = GeminiMCPClient(api_key)
+    return client
 
-# Connect to server and load tools
-def connect_to_server():
+def initialize_session_state():
+    """Initialize session state variables."""
+    if "messages" not in st.session_state:
+        st.session_state.messages = []
+    if "client_initialized" not in st.session_state:
+        st.session_state.client_initialized = False
+    if "server_status" not in st.session_state:
+        st.session_state.server_status = {}
+
+async def initialize_client_async(client):
+    """Initialize client asynchronously."""
     try:
-        async def _connect():
-            async with sse_client(url="http://localhost:8000/sse") as streams:
-                async with ClientSession(*streams) as session:
-                    await session.initialize()
-                    tools_data = await load_tools(session)
-                    tool_object = types.Tool(function_declarations=tools_data)
-                    return session, tools_data, tool_object, True
-        
-        return asyncio.run(_connect())
+        success = await client.initialize()
+        st.session_state.client_initialized = success
+        if success:
+            st.session_state.server_status = await client.get_server_status()
+        return success
     except Exception as e:
-        return None, [], None, False
+        logger.error(f"Client initialization failed: {e}")
+        st.session_state.server_status = {"server_available": False, "error": str(e)}
+        return False
 
-# Refresh tools
-def refresh_tools():
-    session, tools_data, tool_object, connected = connect_to_server()
-    st.session_state.session = session
-    st.session_state.tools = tools_data
-    st.session_state.tool_object = tool_object
-    st.session_state.server_connected = connected
-    return connected
+def display_header():
+    """Display the main header."""
+    col1, col2, col3 = st.columns([1, 2, 1])
+    with col2:
+        st.markdown("<h1 style='text-align: center; margin-bottom: 2rem;'>🤖 Gemini MCP Client</h1>", unsafe_allow_html=True)
 
-# Process user query
-def process_user_query(user_input):
-    if not st.session_state.server_connected:
-        st.session_state.messages.append({
-            "role": "assistant", 
-            "content": "❌ Server not connected. Please refresh tools."
-        })
-        return
-
-    async def _process():
-        llm = st.session_state.llm
-        session = st.session_state.session
-        tools = st.session_state.tool_object
-        
-        # Step 1: Try existing tools
-        tool_called, updated_messages, response_text = await process_query(
-            session, llm, tools, user_input, st.session_state.chat_history
-        )
-        
-        st.session_state.chat_history = updated_messages
-        
-        if tool_called and response_text:
-            st.session_state.messages.append({
-                "role": "assistant", 
-                "content": response_text
-            })
-            return True
-        
-        # Step 2: Check if tool creation needed
-        needs_tool = await llm.determine_tool_creation_necessity(user_input)
-        
-        if not needs_tool:
-            response = response_text or "I can help with that, but please be more specific."
-            st.session_state.messages.append({
-                "role": "assistant", 
-                "content": response
-            })
-            return True
-        
-        # Step 3: Create tool
-        qtype, general_part, _ = await llm.classify_and_split_question(user_input)
-        tool_topic = general_part if qtype == "direct" else user_input
-        proposed_name = predict_tool_name(tool_topic)
-        
-        # Check if tool exists
-        existing_names = {t["name"].lower() for t in st.session_state.tools}
-        if proposed_name.lower() in existing_names:
-            st.session_state.messages.append({
-                "role": "assistant", 
-                "content": f"🔧 Tool '{proposed_name}' exists but wasn't used. Try rephrasing."
-            })
-            return True
-        
-        # Create the tool
-        st.session_state.messages.append({
-            "role": "assistant", 
-            "content": f"🛠️ Creating tool for: **{tool_topic}**"
-        })
-        
-        return qtype, user_input  # Return for reprocessing
+def display_status_bar(client):
+    """Display status information."""
+    col1, col2, col3, col4 = st.columns(4)
     
-    result = asyncio.run(_process())
+    status = st.session_state.server_status
+    server_available = status.get('server_available', False)
     
-    if result == True:
-        return  # Query processed successfully
+    with col1:
+        st.markdown(f"""
+        <div class="metric-card">
+            <h4>Server Status</h4>
+            <p style="color: {'#4CAF50' if server_available else '#f44336'};">
+                {'Connected' if server_available else 'Disconnected'}
+            </p>
+        </div>
+        """, unsafe_allow_html=True)
     
-    # Tool creation needed
-    qtype, original_query = result
+    with col2:
+        st.markdown(f"""
+        <div class="metric-card">
+            <h4>Available Tools</h4>
+            <p>{status.get('available_tools', 0)}</p>
+        </div>
+        """, unsafe_allow_html=True)
     
-    # Actually create the tool
-    tool_topic = st.session_state.messages[-1]["content"].split("**")[1]
-    create_and_update_tool(f"Create a function for {tool_topic}")
+    with col3:
+        st.markdown(f"""
+        <div class="metric-card">
+            <h4>Server Context</h4>
+            <p>{status.get('server_context', 'unknown')}</p>
+        </div>
+        """, unsafe_allow_html=True)
     
-    st.session_state.messages.append({
-        "role": "assistant", 
-        "content": "✅ Tool created! Server restarting..."
-    })
-    
-    # Wait and reprocess for direct queries
-    if qtype == "direct":
-        time.sleep(8)  # Wait for server restart
-        
-        st.session_state.messages.append({
-            "role": "assistant", 
-            "content": "🔄 Reconnecting and processing your request..."
-        })
-        
-        # Refresh connection with fresh session
-        if refresh_tools():
-            # Try the query again with a completely fresh session
-            async def _reprocess():
-                try:
-                    # Create a brand new session connection
-                    async with sse_client(url="http://localhost:8000/sse") as streams:
-                        async with ClientSession(*streams) as fresh_session:
-                            await fresh_session.initialize()
-                            fresh_tools_data = await load_tools(fresh_session)
-                            fresh_tool_object = types.Tool(function_declarations=fresh_tools_data)
-                            
-                            # Update session state with fresh connection
-                            st.session_state.session = fresh_session
-                            st.session_state.tools = fresh_tools_data
-                            st.session_state.tool_object = fresh_tool_object
-                            
-                            llm = st.session_state.llm
-                            
-                            tool_called, updated_messages, response_text = await process_query(
-                                fresh_session, llm, fresh_tool_object, original_query, st.session_state.chat_history
-                            )
-                            
-                            st.session_state.chat_history = updated_messages
-                            
-                            if tool_called and response_text:
-                                st.session_state.messages.append({
-                                    "role": "assistant", 
-                                    "content": f"✅ Success!\n\n{response_text}"
-                                })
-                            else:
-                                st.session_state.messages.append({
-                                    "role": "assistant", 
-                                    "content": "❌ Tool created but couldn't be used. Try again."
-                                })
-                except Exception as e:
-                    st.session_state.messages.append({
-                        "role": "assistant", 
-                        "content": f"❌ Error during reprocessing: {str(e)}"
-                    })
-            
-            asyncio.run(_reprocess())
-        else:
-            st.session_state.messages.append({
-                "role": "assistant", 
-                "content": "❌ Couldn't reconnect. Please refresh tools manually."
-            })
-
-# Initialize LLM
-if st.session_state.llm is None:
-    st.session_state.llm = get_llm()
-
-# Header
-st.markdown('<div class="main-header">', unsafe_allow_html=True)
-st.title("🤖 AgentDRY")
-st.markdown("*AI Assistant with Dynamic Tool Creation*")
-st.markdown('</div>', unsafe_allow_html=True)
-
-# Sidebar
-with st.sidebar:
-    st.header("🧰 Tools Manager")
-    
-    # Server status
-    if st.session_state.server_connected:
-        st.markdown('<p class="status-success">🟢 Server Connected</p>', unsafe_allow_html=True)
-    else:
-        st.markdown('<p class="status-error">🔴 Server Disconnected</p>', unsafe_allow_html=True)
-    
-    # Refresh button
-    if st.button("🔄 Refresh Tools"):
-        with st.spinner("Refreshing..."):
-            if refresh_tools():
-                st.success(f"✅ Loaded {len(st.session_state.tools)} tools!")
-            else:
-                st.error("❌ Could not connect to server")
-        st.rerun()
-    
-    st.markdown("---")
-    
-    # Tools list
-    st.subheader(f"Available Tools ({len(st.session_state.tools)})")
-    
-    if st.session_state.tools:
-        for tool in st.session_state.tools:
-            with st.expander(f"🔧 {tool['name']}", expanded=False):
-                st.markdown(f"**Description:** {tool['description']}")
-                if tool.get('parameters') and tool['parameters'].get('properties'):
-                    st.markdown("**Parameters:**")
-                    for param_name, param_info in tool['parameters']['properties'].items():
-                        param_type = param_info.get('type', 'unknown')
-                        param_desc = param_info.get('description', 'No description')
-                        st.markdown(f"- `{param_name}` ({param_type}): {param_desc}")
-    else:
-        if st.session_state.server_connected:
-            st.info("No tools yet. Ask me to create one!")
-        else:
-            st.error("Connect to server first")
-    
-    st.markdown("---")
-    
-    # Past chats
-    st.subheader("📚 Chat History")
-    
-    if st.session_state.past_chats:
-        if st.button("🗑️ Clear History"):
-            st.session_state.past_chats = []
+    with col4:
+        if st.button("🔄 Refresh", key="refresh_status"):
+            if st.session_state.client_initialized:
+                st.session_state.server_status = asyncio.run(client.get_server_status())
             st.rerun()
-        
-        for i, chat in enumerate(reversed(st.session_state.past_chats)):
-            with st.expander(f"💬 Chat {len(st.session_state.past_chats) - i}"):
-                for role, message in chat:
-                    icon = "👤" if role == "user" else "🤖"
-                    display_msg = message[:100] + "..." if len(message) > 100 else message
-                    st.markdown(f"{icon} **{role.title()}:** {display_msg}")
-    else:
-        st.info("No chat history yet")
 
-# Main chat area
-col1, col2 = st.columns([4, 1])
-
-with col1:
-    # Connect on first load
-    if not st.session_state.server_connected:
-        with st.spinner("Connecting to server..."):
-            refresh_tools()
+def display_chat_interface(client):
+    """Display the main chat interface."""
+    st.markdown("<h2>💬 Chat</h2>", unsafe_allow_html=True)
     
-    # Display messages
-    for message in st.session_state.messages:
-        with st.chat_message(message["role"]):
-            st.markdown(message["content"])
+    # Chat container
+    chat_container = st.container()
+    
+    # Display chat history
+    with chat_container:
+        for message in st.session_state.messages:
+            if message["role"] == "user":
+                st.markdown(f"""
+                <div class="chat-message user-message">
+                    <strong>You:</strong> {message["content"]}
+                </div>
+                """, unsafe_allow_html=True)
+            else:
+                tools_info = ""
+                if message.get("tools_used"):
+                    tools_info = f'<br><small>🔧 Tools used: {", ".join(message["tools_used"])}'
+                    if message.get("tool_args"):
+                        tools_info += f' with args {message["tool_args"]}'
+                    tools_info += "</small>"
+
+                if message.get("tool_created"):
+                    tools_info += '<br><small>🎉 New tool created!</small>'
+                
+                st.markdown(f"""
+                <div class="chat-message assistant-message">
+                    <strong>Assistant:</strong> {message["content"]}
+                    {tools_info}
+                </div>
+                """, unsafe_allow_html=True)
     
     # Chat input
-    if user_input := st.chat_input("Ask me anything or request a new tool..."):
+    with st.form(key="chat_form", clear_on_submit=True):
+        col1, col2 = st.columns([4, 1])
+        
+        with col1:
+            user_input = st.text_input(
+                "Ask me anything...",
+                placeholder="Type your message here...",
+                label_visibility="collapsed"
+            )
+        
+        with col2:
+            submitted = st.form_submit_button("Send 📤", use_container_width=True)
+    
+    # Process user input
+    if submitted and user_input:
         # Add user message
         st.session_state.messages.append({"role": "user", "content": user_input})
         
-        # Handle quit
-        if user_input.lower().strip() == "quit":
-            if st.session_state.messages:
-                st.session_state.past_chats.append(st.session_state.messages.copy())
-            
-            st.session_state.messages = [{"role": "assistant", "content": "👋 Goodbye! Chat saved to history."}]
-            st.session_state.chat_history = []
-            st.rerun()
-        
-        # Process query
-        with st.spinner("Processing..."):
-            process_user_query(user_input)
+        # Show thinking spinner
+        with st.spinner("🤔 Thinking..."):
+            try:
+                # Process query - get the detailed response
+                response_data = asyncio.run(client.process_query(user_input))
+                
+                if response_data:
+                    # response_data is a dict with conversation details
+                    assistant_response = response_data.get("assistant", "No response received")
+                    tools_used = response_data.get("tools_used", [])
+                    tool_created = response_data.get("tool_created", False)
+                    
+                    # Add assistant response
+                    st.session_state.messages.append({
+                        "role": "assistant", 
+                        "content": assistant_response,
+                        "tools_used": tools_used,
+                        "tool_created": tool_created
+                    })
+                    
+                    # Refresh status if tools were used or created
+                    if tools_used or tool_created:
+                        st.session_state.server_status = asyncio.run(client.get_server_status())
+                else:
+                    st.session_state.messages.append({
+                        "role": "assistant", 
+                        "content": "Sorry, I couldn't process your request."
+                    })
+                
+            except Exception as e:
+                error_msg = f"Error: {str(e)}"
+                st.session_state.messages.append({
+                    "role": "assistant", 
+                    "content": error_msg
+                })
+                logger.error(f"Query processing error: {e}")
         
         st.rerun()
 
-with col2:
-    # Status panel
-    st.markdown("### 📊 Status")
+def display_sidebar(client):
+    """Display the sidebar with tools and controls."""
+    with st.sidebar:
+        st.markdown("<h2>🛠️ Tools & Controls</h2>", unsafe_allow_html=True)
+        
+        # Server info section
+        status = st.session_state.server_status
+        server_available = status.get('server_available', False)
+        
+        with st.expander("📊 Server Status", expanded=True):
+            st.markdown(f"**Status:** {'🟢 Connected' if server_available else '🔴 Disconnected'}")
+            st.markdown(f"**Context:** {status.get('server_context', 'unknown')}")
+            st.markdown(f"**Tools:** {status.get('available_tools', 0)}")
+            
+            if status.get('tool_names'):
+                st.markdown("**Available Tools:**")
+                for tool_name in status['tool_names']:
+                    st.markdown(f"  • {tool_name}")
+        
+        # Chat history section
+        with st.expander("📚 Chat History", expanded=False):
+            if st.session_state.messages:
+                # Show last 10 messages - fixed the slice issue
+                recent_messages = st.session_state.messages[-10:] if len(st.session_state.messages) > 10 else st.session_state.messages
+                for i, msg in enumerate(reversed(recent_messages)):
+                    role_icon = "👤" if msg["role"] == "user" else "🤖"
+                    content_preview = msg["content"][:100] + ('...' if len(msg["content"]) > 100 else '')
+                    
+                    st.markdown(f"""
+                    <div style="padding: 0.5rem; margin: 0.2rem 0; background: rgba(255,255,255,0.1); border-radius: 5px;">
+                        <strong>{role_icon} {msg["role"].title()}:</strong><br>
+                        <span style="font-size: 0.9em;">{content_preview}</span>
+                    </div>
+                    """, unsafe_allow_html=True)
+            else:
+                st.info("No chat history yet")
+        
+        # Statistics section
+        if st.session_state.messages:
+            with st.expander("📈 Statistics", expanded=False):
+                total_messages = len(st.session_state.messages)
+                user_messages = len([m for m in st.session_state.messages if m["role"] == "user"])
+                tool_uses = len([m for m in st.session_state.messages if m.get("tools_used")])
+                tools_created = len([m for m in st.session_state.messages if m.get("tool_created")])
+                
+                st.markdown(f"**Total Messages:** {total_messages}")
+                st.markdown(f"**User Messages:** {user_messages}")
+                st.markdown(f"**Tool Uses:** {tool_uses}")
+                st.markdown(f"**Tools Created:** {tools_created}")
+        
+        # Controls section
+        st.markdown("---")
+        st.markdown("<h3>🎛️ Controls</h3>", unsafe_allow_html=True)
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            if st.button("🗑️ Clear Chat", use_container_width=True):
+                st.session_state.messages = []
+                client.clear_conversation()
+                st.success("Chat cleared!")
+                st.rerun()
+        
+        with col2:
+            if st.button("🔄 Refresh Status", use_container_width=True):
+                if st.session_state.client_initialized:
+                    with st.spinner("Refreshing status..."):
+                        try:
+                            st.session_state.server_status = asyncio.run(client.get_server_status())
+                            st.success("Status refreshed!")
+                        except Exception as e:
+                            st.error(f"Refresh failed: {e}")
+                    st.rerun()
+                else:
+                    st.warning("Client not initialized")
+
+def main_app():
+    """Main Streamlit application."""
+    initialize_session_state()
     
-    if st.session_state.server_connected:
-        st.markdown('<p class="status-success">✅ Ready</p>', unsafe_allow_html=True)
-    else:
-        st.markdown('<p class="status-error">❌ Offline</p>', unsafe_allow_html=True)
+    # Get client instance
+    client = get_client()
     
-    st.metric("Tools Available", len(st.session_state.tools))
-    st.metric("Messages", len(st.session_state.messages))
-    st.metric("Past Chats", len(st.session_state.past_chats))
+    # Initialize client if not already done
+    if not st.session_state.client_initialized:
+        with st.spinner("🚀 Initializing client..."):
+            success = asyncio.run(initialize_client_async(client))
+            if not success:
+                st.error("Failed to initialize client. Please check your configuration.")
+                st.error(f"Error details: {st.session_state.server_status.get('error', 'Unknown error')}")
+                st.stop()
+    
+    # Display header
+    display_header()
+    
+    # Create main layout
+    col1, col2 = st.columns([3, 1])
+    
+    with col1:
+        # Status bar
+        display_status_bar(client)
+        st.markdown("---")
+        
+        # Main chat interface
+        display_chat_interface(client)
+    
+    with col2:
+        # Sidebar content
+        display_sidebar(client)
+
+def run_streamlit_app():
+    """Run the Streamlit app."""
+    try:
+        main_app()
+    except Exception as e:
+        st.error(f"Application error: {str(e)}")
+        logger.error(f"Streamlit app error: {e}")
+        # Show error details in development
+        if os.getenv("STREAMLIT_DEBUG", "false").lower() == "true":
+            st.exception(e)
+
+if __name__ == "__main__":
+    # Ensure logs directory exists
+    os.makedirs("logs", exist_ok=True)
+    
+    # Run the app
+    run_streamlit_app()
