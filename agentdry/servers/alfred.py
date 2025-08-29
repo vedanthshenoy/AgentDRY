@@ -16,7 +16,8 @@ import re
 from typing import Dict, Any, Optional, List, Tuple
 from dataclasses import dataclass
 from pathlib import Path
-from mcp.server.fastmcp import FastMCP, Context
+# from mcp.server.fastmcp import FastMCP, Context
+from fastmcp import Context
 
 
 
@@ -314,7 +315,7 @@ Generate ONLY the function definition - no explanations or additional text."""
             user_message = f"Create a Python function for: {query}"
             
             self.logger.info(f"Initiating code generation for query: {query}")
-            result = ctx.request_sampling(
+            result = ctx.sample(
                 messages=[{"role": "user", "content": user_message}],
                 system_prompt=self.SYSTEM_PROMPT,
                 temperature=0.1,
