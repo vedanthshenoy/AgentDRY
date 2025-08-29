@@ -12,11 +12,9 @@ from google import generativeai as genai
 try:
     from google.generativeai.types import Content, Part, FunctionCall, FunctionResponse
 except ImportError:
-    # Fallback imports if the above don't work
     try:
         from google.ai.generativelanguage import Content, Part, FunctionCall, FunctionResponse
     except ImportError:
-        # Use the genai module directly
         Content = genai.protos.Content
         Part = genai.protos.Part
         FunctionCall = genai.protos.FunctionCall
@@ -155,23 +153,25 @@ class MCPToolManager:
             error_msg = f"Tool '{tool_name}' execution failed: {str(e)}"
             return QueryResult(success=False, response=error_msg, error=str(e))
 
-    async def delete_tool(self, tool_name: str) -> bool:
-        """Delete a tool from the server."""
+    async def create_tool_via_server(self, query: str) -> QueryResult:
+        """Create a new tool using the server's create_tool function."""
         try:
-            # Import the delete function
-            from main import delete_tool_from_server
-
-            delete_tool_from_server(tool_name)
-            await asyncio.sleep(2)  # Wait for server restart
-            await self.refresh_tools()
-            return True
+            result = await self.execute_tool("create_tool", {"query": query})
+            if result.success:
+                logger.info(f"Tool creation request processed: {query}")
+                # Wait a bit for server restart
+                await asyncio.sleep(5)
+                # Refresh tools cache to get the new tool
+                await self.refresh_tools()
+            return result
         except Exception as e:
-            logger.error(f"Failed to delete tool: {e}")
-            return False
+            error_msg = f"Failed to create tool via server: {str(e)}"
+            logger.error(error_msg)
+            return QueryResult(success=False, response=error_msg, error=str(e))
 
 
 class GeminiBridge:
-    """Bridge class with intelligent tool calling and creation."""
+    """Bridge class with intelligent tool calling and server-side tool creation."""
 
     def __init__(
         self,
@@ -315,19 +315,26 @@ class GeminiBridge:
         tools_context = "\n".join([f"- {tool.name}: {tool.description}" for tool in available_tools])
         
         decision_prompt = f"""
-        You are an intelligent assistant with access to an MCP server in the {self.server_context} domain.
+        You are an intelligent assistant with access to an MCP server that supports dynamic tool creation.
 
         Available tools:
         {tools_context}
 
         User query: "{query}"
 
+        The server has a 'create_tool' function that can generate new tools using LLM sampling.
+
         Analyze the query and determine the best approach:
 
-        1. If the query can be handled by the existing tools, respond with: "use_tools"
-        2. If the query requires functionality not available in existing tools BUT is clearly within the {self.server_context} domain (like a missing math operation for a math server), respond with: "create_tool"  
+        1. If the query can be handled by existing tools, respond with: "use_tools"
+        2. If the query requires functionality not available in existing tools AND could benefit from a dedicated function, respond with: "create_tool"  
         3. If the query is asking you to explicitly create a function/tool, respond with: "create_tool"
-        4. If the query is completely outside the {self.server_context} domain or is a general question, respond with: "respond_directly"
+        4. If the query is a general question that doesn't need tools, respond with: "respond_directly"
+
+        Note: The server can create mathematical, utility, and computational functions. It's better to create a tool for:
+        - Calculations that could be reused
+        - Complex operations that benefit from dedicated functions
+        - User requests for specific functionality
 
         Respond with ONLY one of these three options: use_tools, create_tool, or respond_directly
         """
@@ -477,7 +484,7 @@ class GeminiBridge:
             )
 
     async def process_query(self, query: str) -> QueryResult:
-        """Process a user query with intelligent decision making."""
+        """Process a user query with intelligent decision making and server-side tool creation."""
         try:
             self.conversation.add_message("user", query)
 
@@ -506,26 +513,35 @@ class GeminiBridge:
                     return QueryResult(success=True, response=response)
                     
             elif decision == "create_tool":
-                # Create a new tool
+                # Create a new tool using server's create_tool function
                 try:
-                    from main import create_and_update_tool
-
                     # Check if this is an explicit tool creation request
                     if any(phrase in query.lower() for phrase in ["create a function", "create a tool", "make a function"]):
                         # Just create the tool and exit
-                        create_and_update_tool(query)
-                        await asyncio.sleep(3)
-                        await self.tool_manager.refresh_tools()
-                        response = f"Tool created successfully based on your request: {query}"
+                        creation_result = await self.tool_manager.create_tool_via_server(query)
+                        if creation_result.success:
+                            response = f"Tool created successfully: {creation_result.response}"
+                        else:
+                            response = f"Tool creation failed: {creation_result.response}"
+                        
                         self.conversation.add_message("assistant", response)
-                        return QueryResult(success=True, response=response, tool_used=False)
+                        return QueryResult(success=creation_result.success, response=response, tool_used=False)
                     else:
                         # Create tool and then use it to answer the query
-                        create_and_update_tool(f"Create a function to handle: {query}")
-                        await asyncio.sleep(8)
-                        await self.tool_manager.refresh_tools()
+                        logger.info(f"Creating new tool for query: {query}")
+                        creation_result = await self.tool_manager.create_tool_via_server(f"Create a function to handle: {query}")
+                        
+                        if not creation_result.success:
+                            # Tool creation failed, respond directly
+                            response = await self.llm.generate_response(f"I couldn't create a tool for this, but I can help: {query}")
+                            self.conversation.add_message("assistant", response)
+                            return QueryResult(success=True, response=response)
 
-                        # Try using the new tool
+                        # Try using the new tool by re-executing the query with updated tools
+                        logger.info("Tool created, waiting for server restart and trying to use new tools...")
+                        await asyncio.sleep(8)  # Wait for server restart
+                        
+                        # Refresh tools and try again
                         updated_tools = await self.tool_manager.get_tools()
                         tool_result = await self._iterative_tool_execution(query, updated_tools)
                         
@@ -541,18 +557,13 @@ class GeminiBridge:
                                 tools_called=tool_result.tools_called,
                             )
                         else:
-                            # Tool creation/execution failed, respond directly
-                            response = await self.llm.generate_response(f"Please answer this query: {query}")
+                            # Tool creation succeeded but execution failed, respond with creation status
+                            response = f"Tool was created ({creation_result.response}) but I'll answer your question directly: {await self.llm.generate_response(query)}"
                             self.conversation.add_message("assistant", response)
                             return QueryResult(success=True, response=response)
 
-                except ImportError:
-                    logger.error("Cannot import tool creation function")
-                    response = await self.llm.generate_response(f"Please answer this query: {query}")
-                    self.conversation.add_message("assistant", response)
-                    return QueryResult(success=True, response=response)
                 except Exception as e:
-                    logger.error(f"Tool creation failed: {e}")
+                    logger.error(f"Tool creation via server failed: {e}")
                     response = await self.llm.generate_response(f"Please answer this query: {query}")
                     self.conversation.add_message("assistant", response)
                     return QueryResult(success=True, response=response)
@@ -569,10 +580,6 @@ class GeminiBridge:
             return QueryResult(
                 success=False, response="Sorry, I encountered an error.", error=str(e)
             )
-
-    async def delete_tool(self, tool_name: str) -> bool:
-        """Delete a tool."""
-        return await self.tool_manager.delete_tool(tool_name)
 
     def get_conversation_history(self) -> List[Dict[str, str]]:
         """Get conversation history."""
@@ -593,9 +600,9 @@ class GeminiBridge:
         return result
 
 
-# Enhanced CLI with intelligent decision making
+# Enhanced CLI with server-side tool creation
 async def main():
-    """Enhanced CLI interface with intelligent decision making."""
+    """Enhanced CLI interface with server-side tool creation via sampling."""
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
         print("Error: GEMINI_API_KEY not found")
@@ -607,9 +614,10 @@ async def main():
         print("Failed to initialize bridge")
         return
 
-    print("🤖 Enhanced Bridge ready with intelligent tool calling!")
+    print("🤖 Enhanced Bridge ready with server-side tool creation!")
     print(f"🔧 Detected server context: {bridge.server_context}")
     print("Type 'quit' to exit, 'tools' to list available tools, 'clear' to clear history")
+    print("The server can now create new tools dynamically using LLM sampling!")
 
     while True:
         try:
