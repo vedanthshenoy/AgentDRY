@@ -1,16 +1,16 @@
 """
 Enhanced MCP Server with Dynamic Tool Creation
+
+A minimal server implementation that relies on Alfred (alfred.py) for all
+helper functionality. This server focuses solely on defining MCP tools
+and handling the main execution loop.
 """
 
 import os
-
-# Support both import paths depending on installed version
-try:
-    from fastmcp import FastMCP, Context
-except ImportError:
-    from mcp.server.fastmcp import FastMCP, Context  # fallback
-
+import os
+from mcp.server.fastmcp import FastMCP, Context
 from alfred import DynamicToolManager
+
 
 # Initialize the server and Alfred
 current_file = os.path.abspath(__file__)
@@ -19,22 +19,46 @@ mcp = FastMCP("Enhanced Math Server")
 
 
 @mcp.tool()
-async def create_tool(query: str, ctx: Context) -> str:
+def create_tool(query: str, ctx: Context) -> str:
     """
-    Create a new tool dynamically based on user query using the client's LLM.
+    Create a new tool dynamically based on user query using LLM sampling.
+    This function uses the client's LLM to generate Python code for the requested functionality.
+    
+    Args:
+        query (str): Description of the tool to create (e.g., "create a factorial function")
+        ctx (Context): FastMCP context for LLM sampling
+    
+    Returns:
+        str: Status message about tool creation
     """
-    return await alfred.create_tool(query, ctx)
+    return alfred.create_tool(query, ctx)
 
 
 @mcp.tool()
 def list_available_functions(ctx: Context) -> str:
-    """List all available functions in this MCP server."""
+    """
+    List all available functions in this MCP server by analyzing the server file.
+    
+    Args:
+        ctx (Context): FastMCP context
+        
+    Returns:
+        str: List of available functions with descriptions
+    """
     return alfred.list_available_functions()
 
 
 @mcp.tool()
 def get_server_info(ctx: Context) -> str:
-    """Get information about this MCP server including capabilities and usage."""
+    """
+    Get information about this MCP server including capabilities and usage.
+    
+    Args:
+        ctx (Context): FastMCP context
+        
+    Returns:
+        str: Server information and capabilities
+    """
     return alfred.get_server_info()
 
 
@@ -61,12 +85,13 @@ def add(a: int, b: int) -> int:
 if __name__ == "__main__":
     # Initialize Alfred and start all systems
     alfred.initialize()
+    
     alfred.logger.info("Enhanced MCP Server started with dynamic tool creation capability.")
     alfred.logger.info(f"Watching {current_file} for changes...")
-    alfred.logger.info("Use create_tool() to dynamically add new capabilities!")
-
+    alfred.logger.info("Use create_tool() function to dynamically add new capabilities!")
+    
     try:
-        mcp.run(transport="sse")
+        mcp.run(transport='sse')
     except KeyboardInterrupt:
         alfred.logger.info("Server shutdown requested by user")
         alfred.shutdown()
