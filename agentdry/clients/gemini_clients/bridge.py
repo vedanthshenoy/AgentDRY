@@ -23,6 +23,9 @@ except ImportError:
 # Import client components
 from gemini_client import ConnectionManager, GeminiClient, ConversationManager
 
+# MCP Sampling imports
+from fastmcp.client.sampling import SamplingMessage, SamplingParams, RequestContext
+
 # Simple logging setup
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
@@ -170,8 +173,62 @@ class MCPToolManager:
             return QueryResult(success=False, response=error_msg, error=str(e))
 
 
+class SamplingHandler:
+    """Handles server-initiated sampling requests using Gemini."""
+    
+    def __init__(self, gemini_client: GeminiClient):
+        self.gemini_client = gemini_client
+        self.logger = logger
+    
+    async def handle_sampling(
+        self,
+        messages: List[SamplingMessage],
+        params: SamplingParams,
+        context: RequestContext
+    ) -> str:
+        """Handle sampling request from server."""
+        try:
+            # Extract conversation from messages
+            conversation_parts = []
+            for message in messages:
+                role = message.role
+                # Extract text content from message
+                if hasattr(message.content, 'text'):
+                    content = message.content.text
+                elif isinstance(message.content, str):
+                    content = message.content
+                else:
+                    content = str(message.content)
+                
+                conversation_parts.append(f"{role}: {content}")
+            
+            # Build the prompt
+            system_prompt = params.systemPrompt or "You are a helpful assistant."
+            conversation_text = "\n".join(conversation_parts)
+            
+            full_prompt = f"{system_prompt}\n\nConversation:\n{conversation_text}"
+            
+            # Use sampling parameters
+            temperature = params.temperature if params.temperature is not None else 0.0
+            
+            self.logger.info(f"Processing sampling request with temperature: {temperature}")
+            
+            # Generate response using Gemini
+            response = await self.gemini_client.generate_response(
+                full_prompt, 
+                temperature=temperature
+            )
+            
+            return response
+            
+        except Exception as e:
+            error_msg = f"Sampling handler error: {str(e)}"
+            self.logger.error(error_msg)
+            return "Error: Could not process sampling request"
+
+
 class GeminiBridge:
-    """Bridge class with intelligent tool calling and server-side tool creation."""
+    """Bridge class with intelligent tool calling and FastMCP sampling support."""
 
     def __init__(
         self,
@@ -180,7 +237,12 @@ class GeminiBridge:
         max_tool_iterations: int = 5,
     ):
         self.llm = GeminiClient(api_key)
-        self.connection_manager = ConnectionManager(server_url)
+        self.sampling_handler = SamplingHandler(self.llm)
+        
+        # Create connection manager with sampling handler
+        sampling_handler_func = self.sampling_handler.handle_sampling
+        self.connection_manager = ConnectionManager(server_url, sampling_handler_func)
+        
         self.tool_manager = MCPToolManager(self.connection_manager)
         self.conversation = ConversationManager()
         self.server_available = False
@@ -188,7 +250,7 @@ class GeminiBridge:
         self.server_context = ""  # Store server context/domain
 
     async def initialize(self) -> bool:
-        """Initialize the bridge."""
+        """Initialize the bridge with sampling support."""
         try:
             self.server_available = await self.connection_manager.check_server_health()
             if self.server_available:
@@ -614,10 +676,10 @@ async def main():
         print("Failed to initialize bridge")
         return
 
-    print("🤖 Enhanced Bridge ready with server-side tool creation!")
+    print("🤖 Enhanced Bridge ready with FastMCP sampling support!")
     print(f"🔧 Detected server context: {bridge.server_context}")
     print("Type 'quit' to exit, 'tools' to list available tools, 'clear' to clear history")
-    print("The server can now create new tools dynamically using LLM sampling!")
+    print("The server can now create new tools dynamically using client-side LLM sampling!")
 
     while True:
         try:

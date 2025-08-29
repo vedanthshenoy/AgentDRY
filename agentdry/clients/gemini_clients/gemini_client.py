@@ -4,7 +4,7 @@ import os
 import sys
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Callable
 
 import httpx
 from dotenv import load_dotenv
@@ -12,6 +12,7 @@ from google import generativeai as genai
 
 from mcp import ClientSession
 from mcp.client.sse import sse_client
+from fastmcp.client.sampling import SamplingMessage, SamplingParams, RequestContext
 
 # Simple logging setup
 logging.basicConfig(
@@ -23,10 +24,11 @@ load_dotenv()
 
 
 class ConnectionManager:
-    """Manages MCP server connections."""
+    """Manages MCP server connections with sampling support."""
 
-    def __init__(self, server_url: str = "http://localhost:8000/sse"):
+    def __init__(self, server_url: str = "http://localhost:8000/sse", sampling_handler: Optional[Callable] = None):
         self.server_url = server_url
+        self.sampling_handler = sampling_handler
 
     async def check_server_health(self) -> bool:
         """Check if the MCP server is responding."""
@@ -40,11 +42,16 @@ class ConnectionManager:
 
     @asynccontextmanager
     async def get_session(self):
-        """Get an MCP session."""
+        """Get an MCP session with sampling handler support."""
         try:
             streams = sse_client(url=self.server_url)
             async with streams as stream_pair:
                 session = ClientSession(*stream_pair)
+                
+                # Set up sampling handler if provided
+                if self.sampling_handler:
+                    session.sampling_handler = self.sampling_handler
+                
                 async with session:
                     await asyncio.wait_for(session.initialize(), timeout=10.0)
                     yield session
@@ -105,16 +112,78 @@ class ConversationManager:
         self.history.clear()
 
 
+class SamplingClient:
+    """Client specifically designed to handle sampling requests."""
+    
+    def __init__(self, gemini_client: GeminiClient):
+        self.gemini_client = gemini_client
+        self.logger = logger
+    
+    async def handle_sampling_request(
+        self,
+        messages: List[SamplingMessage],
+        params: SamplingParams,
+        context: RequestContext
+    ) -> str:
+        """Handle a sampling request from the server."""
+        try:
+            # Extract conversation from messages
+            conversation_parts = []
+            for message in messages:
+                role = message.role
+                # Extract text content from message
+                if hasattr(message.content, 'text'):
+                    content = message.content.text
+                elif isinstance(message.content, str):
+                    content = message.content
+                else:
+                    content = str(message.content)
+                
+                conversation_parts.append(f"{role}: {content}")
+            
+            # Build the prompt
+            system_prompt = params.systemPrompt or "You are a helpful assistant."
+            conversation_text = "\n".join(conversation_parts)
+            
+            full_prompt = f"{system_prompt}\n\nConversation:\n{conversation_text}"
+            
+            # Use sampling parameters
+            temperature = params.temperature if params.temperature is not None else 0.0
+            
+            self.logger.info(f"Processing sampling request with temperature: {temperature}")
+            
+            # Generate response using Gemini
+            response = await self.gemini_client.generate_response(
+                full_prompt, 
+                temperature=temperature
+            )
+            
+            return response
+            
+        except Exception as e:
+            error_msg = f"Sampling request failed: {str(e)}"
+            self.logger.error(error_msg)
+            return "Error: Could not process sampling request"
+
+
 class GeminiMCPClient:
-    """Main client class for handling communication and conversation management."""
+    """Main client class for handling communication and conversation management with sampling support."""
 
     def __init__(
         self,
         api_key: str,
         server_url: str = "http://localhost:8000/sse",
+        enable_sampling: bool = True,
     ):
         self.llm = GeminiClient(api_key)
-        self.connection_manager = ConnectionManager(server_url)
+        self.sampling_client = SamplingClient(self.llm) if enable_sampling else None
+        
+        # Create sampling handler function
+        sampling_handler = None
+        if enable_sampling and self.sampling_client:
+            sampling_handler = self.sampling_client.handle_sampling_request
+        
+        self.connection_manager = ConnectionManager(server_url, sampling_handler)
         self.conversation = ConversationManager()
         self.server_available = False
 
@@ -153,19 +222,19 @@ class GeminiMCPClient:
 
 # Enhanced CLI interface
 async def main():
-    """Basic CLI interface for the client."""
+    """Basic CLI interface for the client with sampling support."""
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
         print("Error: GEMINI_API_KEY not found")
         return
 
-    client = GeminiMCPClient(api_key)
+    client = GeminiMCPClient(api_key, enable_sampling=True)
 
     if not await client.initialize_connection():
         print("Failed to initialize client")
         return
 
-    print("🤖 Gemini MCP Client ready!")
+    print("Gemini MCP Client ready with sampling support!")
     print("Type 'quit' to exit, 'clear' to clear history")
 
     while True:
