@@ -8,7 +8,7 @@ and handling the main execution loop.
 
 import os
 import os
-from fastmcp import FastMCP, Context
+from mcp.server.fastmcp import FastMCP, Context
 from alfred import DynamicToolManager
 
 
